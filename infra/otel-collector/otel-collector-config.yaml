@@ -14,7 +14,6 @@ processors:
 exporters:
   prometheus:
     endpoint: 0.0.0.0:8889
-    namespace: "claude"
   debug:
     verbosity: basic
 

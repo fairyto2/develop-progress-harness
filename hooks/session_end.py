@@ -20,10 +20,15 @@ Exit codes:
 
 import json
 import logging
+import os
 import sys
 import time
 import warnings
 from typing import Any
+
+# Ensure project root is on sys.path so ``lib`` is importable regardless
+# of the working directory from which the hook is invoked.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.config import Config
 from lib.otel_metrics import create_histogram, flush_metrics, init_meter
@@ -32,22 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_duration(event_data: dict[str, Any]) -> float:
-    """Calculate session duration in seconds from hook event data.
-
-    Tries the following strategies in order:
-
-    1. An explicit ``duration_seconds`` field in the event payload.
-    2. A ``start_time`` Unix-timestamp field, compared to ``time.time()``.
-    3. A ``session_id`` containing an embedded timestamp
-       (e.g. ``sess-20250508-143022``), compared to ``time.time()``.
-    4. Falls back to 0.0 with a warning if nothing is parseable.
-
-    Args:
-        event_data: Parsed JSON dict from stdin.
-
-    Returns:
-        Session duration in seconds (float).
-    """
+    """Calculate session duration in seconds from hook event data."""
     if "duration_seconds" in event_data:
         try:
             return float(event_data["duration_seconds"])

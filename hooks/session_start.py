@@ -17,8 +17,13 @@ Exit codes:
 
 import json
 import logging
+import os
 import sys
 import warnings
+
+# Ensure project root is on sys.path so ``lib`` is importable regardless
+# of the working directory from which the hook is invoked.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.config import Config
 from lib.otel_metrics import create_counter, flush_metrics, init_meter

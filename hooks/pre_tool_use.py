@@ -25,8 +25,13 @@ import warnings
 # of the working directory from which the hook is invoked.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.config import Config
-from lib.otel_metrics import create_counter, flush_metrics, init_meter
+try:
+    from lib.config import Config
+    from lib.otel_metrics import create_counter, flush_metrics, init_meter
+except ImportError:
+    # OTel SDK not installed — exit gracefully so pip install / pytest
+    # commands are not blocked by this hook.
+    sys.exit(0)
 
 logger = logging.getLogger(__name__)
 
