@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import subprocess
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -139,6 +140,615 @@ def _prometheus_name(otel_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline Diagnostic Reporting
+# ---------------------------------------------------------------------------
+
+# Human-readable labels for each pipeline stage.
+_PIPELINE_STAGES = [
+    "hook_execution",
+    "otel_export",
+    "collector_receive",
+    "prometheus_scrape",
+    "metric_query",
+]
+
+
+@dataclass
+class PipelineDiagnosticReport:
+    """Structured result of a single pipeline stage diagnostic check.
+
+    Attributes:
+        stage: Name of the pipeline stage that was checked (one of
+            ``_PIPELINE_STAGES``).
+        passed: Whether the stage check succeeded.
+        message: Human-readable summary of the check result.
+        details: Additional context or error output relevant to the failure.
+        suggestions: List of remediation hints shown when the stage fails.
+    """
+
+    stage: str
+    passed: bool
+    message: str
+    details: str = ""
+    suggestions: list[str] = field(default_factory=list)
+
+    def as_error_string(self) -> str:
+    """Format the report as a detailed multi-line error string.
+
+        Returns:
+            A formatted string suitable for inclusion in assertion messages
+            or diagnostic logs.  Includes the stage name, message, details,
+            and any suggestions.
+        """
+        lines = [f"[{self.stage}] {self.message}"]
+        if self.details:
+            lines.append(f"  Details: {self.details}")
+        if self.suggestions:
+            lines.append("  Suggestions:")
+            for suggestion in self.suggestions:
+                lines.append(f"    - {suggestion}")
+        return "\n".join(lines)
+
+
+class TestPipelineDiagnostics:
+    """Diagnostic helpers for the Hook-to-Prometheus metrics pipeline.
+
+    Each public method checks **one** pipeline stage independently and
+    returns a ``PipelineDiagnosticReport`` indicating pass/fail with
+    detailed context and remediation suggestions.  Tests can call the
+    methods individually or use ``run_full_diagnosis`` to check all
+    stages in sequence and collect a complete report.
+
+    The five pipeline stages are:
+
+    1. **hook_execution** — The hook script runs successfully (exit code 0).
+    2. **otel_export** — The hook script's stderr does not contain OTel
+       export errors.
+    3. **collector_receive** — The OTel Collector health endpoint is
+       reachable (verifies the collector is accepting telemetry).
+    4. **prometheus_scrape** — Prometheus is healthy and its ``/targets``
+       endpoint shows the collector target is up.
+    5. **metric_query** — The expected metric is queryable via the
+       Prometheus HTTP API.
+
+    Usage example::
+
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
+            "session_start.py", sample_data, "claude_session_count_total",
+        )
+        failures = [r for r in reports if not r.passed]
+        assert not failures, "\\n".join(r.as_error_string() for r in failures)
+    """
+
+    def __init__(
+        self,
+        prometheus_client: Any,
+        collector_url: str = "http://localhost:8889",
+        prometheus_url: str = "http://localhost:9090",
+    ) -> None:
+        self._prom = prometheus_client
+        self._collector_url = collector_url
+        self._prometheus_url = prometheus_url
+
+    # ------------------------------------------------------------------
+    # Stage 1: Hook Execution
+    # ------------------------------------------------------------------
+
+    def check_hook_execution(
+        self,
+        script_name: str,
+        input_data: dict[str, Any],
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], PipelineDiagnosticReport]:
+        """Check that a hook script runs and exits with code 0.
+
+        Args:
+            script_name: Filename of the hook script (e.g. ``"session_start.py"``).
+            input_data: Dictionary serialised as JSON and piped to stdin.
+            extra_env: Additional environment variables for the hook process.
+
+        Returns:
+            A tuple of ``(completed_process, diagnostic_report)`` so callers
+            can inspect the raw process output if needed.
+        """
+        try:
+            result = _run_hook_script(script_name, input_data, extra_env=extra_env)
+        except FileNotFoundError:
+            return (
+                subprocess.CompletedProcess(
+                    ["python", script_name], -1, "", "script not found"
+                ),
+                PipelineDiagnosticReport(
+                    stage="hook_execution",
+                    passed=False,
+                    message=(
+                        f"Hook script '{script_name}' not found at "
+                        f"{os.path.join(_HOOKS_DIR, script_name)}"
+                    ),
+                    details="The hooks directory may be missing or incomplete.",
+                    suggestions=[
+                        "Verify the hooks directory exists at the expected path.",
+                        "Run 'git status' to ensure hooks/ is not gitignored.",
+                        "Check that the script filename is spelled correctly.",
+                    ],
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                subprocess.CompletedProcess(
+                    ["python", script_name], -1, "", "timeout"
+                ),
+                PipelineDiagnosticReport(
+                    stage="hook_execution",
+                    passed=False,
+                    message=f"Hook script '{script_name}' timed out after 30s",
+                    details="The script did not exit within the configured timeout.",
+                    suggestions=[
+                        "Check if the OTel Collector is reachable from the host.",
+                        "Inspect hook logs for infinite loops or hanging I/O.",
+                        "Increase the subprocess timeout if the environment is slow.",
+                    ],
+                ),
+            )
+
+        if result.returncode == 0:
+            report = PipelineDiagnosticReport(
+                stage="hook_execution",
+                passed=True,
+                message=f"Hook script '{script_name}' exited successfully (code 0)",
+            )
+        else:
+            report = PipelineDiagnosticReport(
+                stage="hook_execution",
+                passed=False,
+                message=(
+                    f"Hook script '{script_name}' exited with code "
+                    f"{result.returncode}"
+                ),
+                details=f"stderr: {result.stderr.strip()}" if result.stderr else "",
+                suggestions=[
+                    "Check the hook script for Python syntax errors.",
+                    "Verify all required environment variables are set.",
+                    "Run the script manually with the same input to reproduce.",
+                ],
+            )
+
+        return result, report
+
+    # ------------------------------------------------------------------
+    # Stage 2: OTel Export
+    # ------------------------------------------------------------------
+
+    def check_otel_export(
+        self,
+        result: subprocess.CompletedProcess[str],
+        script_name: str,
+    ) -> PipelineDiagnosticReport:
+        """Check that the hook script did not emit OTel export errors.
+
+        Inspects the subprocess stderr for common OTel export failure
+        indicators (connection refused, timeout, gRPC errors).
+
+        Args:
+            result: The completed process from ``_run_hook_script``.
+            script_name: Name of the hook script (for reporting).
+
+        Returns:
+            A diagnostic report for the OTel export stage.
+        """
+        error_indicators = [
+            "Connection refused",
+            "connection refused",
+            "OTLP export failed",
+            "grpc",
+            "timeout",
+            "unreachable",
+        ]
+
+        stderr_lower = result.stderr.lower() if result.stderr else ""
+
+        if result.returncode != 0:
+            return PipelineDiagnosticReport(
+                stage="otel_export",
+                passed=False,
+                message=(
+                    f"OTel export check skipped — '{script_name}' exited "
+                    f"with code {result.returncode}"
+                ),
+                details="Cannot verify OTel export when the hook itself failed.",
+                suggestions=[
+                    "Fix the hook execution error first (see hook_execution stage).",
+                ],
+            )
+
+        matched = [ind for ind in error_indicators if ind.lower() in stderr_lower]
+        if matched:
+            return PipelineDiagnosticReport(
+                stage="otel_export",
+                passed=False,
+                message=(
+                    f"OTel export errors detected in '{script_name}' stderr"
+                ),
+                details=(
+                    f"Matched error indicators: {', '.join(matched)}. "
+                    f"Full stderr: {result.stderr.strip()}"
+                ),
+                suggestions=[
+                    "Verify the OTel Collector is running: docker compose ps otel-collector",
+                    f"Check that {_OTEL_ENDPOINT} is reachable from the host.",
+                    "Inspect collector logs: docker compose logs otel-collector",
+                    "Ensure no firewall rules block gRPC (port 4317) or HTTP (port 4318).",
+                ],
+            )
+
+        return PipelineDiagnosticReport(
+            stage="otel_export",
+            passed=True,
+            message=f"No OTel export errors detected for '{script_name}'",
+            details=(
+                f"stderr: {result.stderr.strip()}"
+                if result.stderr.strip()
+                else "(no stderr output)"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 3: Collector Receive
+    # ------------------------------------------------------------------
+
+    def check_collector_receive(self) -> PipelineDiagnosticReport:
+        """Check that the OTel Collector is healthy and accepting telemetry.
+
+        Probes the collector's health/readiness endpoint to verify it is
+        running and capable of receiving OTLP data.
+
+        Returns:
+            A diagnostic report for the collector receive stage.
+        """
+        import urllib.error
+        import urllib.request
+
+        health_url = f"{self._collector_url}/"
+
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if 200 <= resp.status < 400:
+                    return PipelineDiagnosticReport(
+                        stage="collector_receive",
+                        passed=True,
+                        message=(
+                            f"OTel Collector is healthy at {health_url} "
+                            f"(HTTP {resp.status})"
+                        ),
+                    )
+                return PipelineDiagnosticReport(
+                    stage="collector_receive",
+                    passed=False,
+                    message=(
+                        f"OTel Collector returned unexpected status "
+                        f"{resp.status} at {health_url}"
+                    ),
+                    suggestions=[
+                        "Check collector logs: docker compose logs otel-collector",
+                        "Verify the collector configuration file is valid.",
+                        "Restart the collector: docker compose restart otel-collector",
+                    ],
+                )
+        except urllib.error.URLError as exc:
+            return PipelineDiagnosticReport(
+                stage="collector_receive",
+                passed=False,
+                message=f"OTel Collector is unreachable at {health_url}",
+                details=str(exc),
+                suggestions=[
+                    "Check if the collector container is running: docker compose ps",
+                    "Verify port mapping: docker compose port otel-collector 8889",
+                    "Restart the stack: docker compose down && docker compose up -d",
+                    "Check Docker network configuration.",
+                ],
+            )
+        except Exception as exc:
+            return PipelineDiagnosticReport(
+                stage="collector_receive",
+                passed=False,
+                message=f"Unexpected error checking OTel Collector: {exc}",
+                details=str(exc),
+                suggestions=[
+                    "Check Docker daemon status.",
+                    "Verify docker-compose.yml service configuration.",
+                ],
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 4: Prometheus Scrape
+    # ------------------------------------------------------------------
+
+    def check_prometheus_scrape(self) -> PipelineDiagnosticReport:
+        """Check that Prometheus is healthy and scraping the OTel Collector.
+
+        Verifies two things:
+
+        1. The Prometheus health endpoint (``/-/healthy``) returns 200.
+        2. The ``/api/v1/targets`` endpoint shows the collector scrape target
+           is in the ``up`` state.
+
+        Returns:
+            A diagnostic report for the Prometheus scrape stage.
+        """
+        import urllib.error
+        import urllib.request
+
+        # Check Prometheus health first.
+        health_url = f"{self._prometheus_url}/-/healthy"
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    return PipelineDiagnosticReport(
+                        stage="prometheus_scrape",
+                        passed=False,
+                        message=(
+                            f"Prometheus health check returned HTTP "
+                            f"{resp.status}"
+                        ),
+                        suggestions=[
+                            "Check Prometheus logs: docker compose logs prometheus",
+                            "Verify prometheus.yml configuration.",
+                            "Restart Prometheus: docker compose restart prometheus",
+                        ],
+                    )
+        except urllib.error.URLError as exc:
+            return PipelineDiagnosticReport(
+                stage="prometheus_scrape",
+                passed=False,
+                message=f"Prometheus is unreachable at {self._prometheus_url}",
+                details=str(exc),
+                suggestions=[
+                    "Check if Prometheus container is running: docker compose ps",
+                    "Verify port mapping: docker compose port prometheus 9090",
+                    "Restart the stack: docker compose down && docker compose up -d",
+                ],
+            )
+
+        # Check collector scrape target via /api/v1/targets.
+        targets_url = f"{self._prometheus_url}/api/v1/targets"
+        try:
+            req = urllib.request.Request(targets_url, method="GET")
+            req.add_header("Accept", "application/json")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read().decode("utf-8")
+                data = json.loads(body)
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            return PipelineDiagnosticReport(
+                stage="prometheus_scrape",
+                passed=False,
+                message="Failed to query Prometheus targets API",
+                details=str(exc),
+                suggestions=[
+                    "Verify Prometheus is fully started (may need more time).",
+                    "Check Prometheus logs for configuration errors.",
+                ],
+            )
+
+        # Inspect active targets for the collector.
+        active_targets = data.get("data", {}).get("activeTargets", [])
+        collector_targets = [
+            t for t in active_targets
+            if "otel-collector" in t.get("labels", {}).get("job", "")
+            or "8889" in t.get("scrapeUrl", "")
+        ]
+
+        if not collector_targets:
+            # Fallback: check if any target with the collector port exists.
+            all_scrape_urls = [
+                t.get("scrapeUrl", "") for t in active_targets
+            ]
+            return PipelineDiagnosticReport(
+                stage="prometheus_scrape",
+                passed=False,
+                message=(
+                    "No OTel Collector scrape target found in Prometheus"
+                ),
+                details=f"Active targets: {json.dumps(all_scrape_urls)}",
+                suggestions=[
+                    "Verify prometheus.yml includes a scrape_config for the collector.",
+                    "Ensure the collector's Prometheus exporter port (8889) matches.",
+                    "Reload Prometheus config: docker compose exec prometheus kill -SIGHUP 1",
+                ],
+            )
+
+        for target in collector_targets:
+            health = target.get("health", "unknown")
+            if health != "up":
+                last_error = target.get("lastErrorScrape", "") or target.get(
+                    "lastError", ""
+                )
+                return PipelineDiagnosticReport(
+                    stage="prometheus_scrape",
+                    passed=False,
+                    message=(
+                        f"Prometheus collector scrape target health is "
+                        f"'{health}' (expected 'up')"
+                    ),
+                    details=(
+                        f"Target: {target.get('scrapeUrl', 'unknown')}. "
+                        f"Last error: {last_error}"
+                    ),
+                    suggestions=[
+                        "Check if the OTel Collector Prometheus exporter is enabled.",
+                        "Verify the collector port matches Prometheus scrape_config.",
+                        "Inspect collector logs: docker compose logs otel-collector",
+                    ],
+                )
+
+        return PipelineDiagnosticReport(
+            stage="prometheus_scrape",
+            passed=True,
+            message="Prometheus is healthy and scraping the OTel Collector",
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 5: Metric Query
+    # ------------------------------------------------------------------
+
+    def check_metric_query(
+        self,
+        metric_name: str,
+        wait: bool = True,
+    ) -> PipelineDiagnosticReport:
+        """Check that a specific metric is queryable in Prometheus.
+
+        Args:
+            metric_name: Full Prometheus metric name (e.g.
+                ``"claude_tool_invocations_total"``).
+            wait: If True, use ``wait_for_metric`` (with retry/timeout).
+                If False, perform a single query via ``query_metric_exists``.
+
+        Returns:
+            A diagnostic report for the metric query stage.
+        """
+        if not self._prom.is_healthy():
+            return PipelineDiagnosticReport(
+                stage="metric_query",
+                passed=False,
+                message="Cannot query metrics — Prometheus is not healthy",
+                suggestions=[
+                    "Check Prometheus logs: docker compose logs prometheus",
+                    "Verify Prometheus is running: docker compose ps prometheus",
+                    "Restart Prometheus: docker compose restart prometheus",
+                ],
+            )
+
+        try:
+            if wait:
+                self._prom.wait_for_metric(metric_name)
+            else:
+                found = self._prom.query_metric_exists(metric_name)
+                if not found:
+                    return PipelineDiagnosticReport(
+                        stage="metric_query",
+                        passed=False,
+                        message=f"Metric '{metric_name}' not found in Prometheus",
+                        details="A single query found no data points for this metric.",
+                        suggestions=[
+                            "The metric may need more time to propagate. Retry with wait=True.",
+                            "Verify the hook script emitted this metric (check otel_export stage).",
+                            "Query all metrics: curl http://localhost:9090/api/v1/label/__name__/values",
+                            "Check Prometheus targets to confirm scrape is working.",
+                        ],
+                    )
+        except Exception as exc:
+            return PipelineDiagnosticReport(
+                stage="metric_query",
+                passed=False,
+                message=f"Failed to query metric '{metric_name}' in Prometheus",
+                details=str(exc),
+                suggestions=[
+                    "Verify the metric name is correct (check _PROMETHEUS_COUNTER_NAMES/_PROMETHEUS_HISTOGRAM_NAMES).",
+                    "Check that the hook script ran successfully and exported the metric.",
+                    "Inspect Prometheus logs: docker compose logs prometheus",
+                    "Try querying Prometheus directly: curl 'http://localhost:9090/api/v1/query?query=UP'",
+                ],
+            )
+
+        return PipelineDiagnosticReport(
+            stage="metric_query",
+            passed=True,
+            message=f"Metric '{metric_name}' found in Prometheus",
+        )
+
+    # ------------------------------------------------------------------
+    # Full Pipeline Diagnosis
+    # ------------------------------------------------------------------
+
+    def run_full_diagnosis(
+        self,
+        script_name: str,
+        input_data: dict[str, Any],
+        prometheus_metric_name: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> list[PipelineDiagnosticReport]:
+        """Run all five pipeline stages and collect diagnostic reports.
+
+        Executes each stage in order.  If a stage fails, subsequent stages
+        that depend on it are still checked so that the caller gets a
+        complete picture of all issues.
+
+        Args:
+            script_name: Filename of the hook script to run.
+            input_data: Dictionary serialised as JSON and piped to stdin.
+            prometheus_metric_name: Expected Prometheus metric name.
+            extra_env: Additional environment variables for the hook process.
+
+        Returns:
+            A list of five ``PipelineDiagnosticReport`` instances, one per
+            pipeline stage, in execution order.
+        """
+        reports: list[PipelineDiagnosticReport] = []
+
+        # Stage 1: Hook execution.
+        result, hook_report = self.check_hook_execution(
+            script_name, input_data, extra_env=extra_env,
+        )
+        reports.append(hook_report)
+
+        # Stage 2: OTel export (inspect hook stderr).
+        otel_report = self.check_otel_export(result, script_name)
+        reports.append(otel_report)
+
+        # Stage 3: Collector health.
+        collector_report = self.check_collector_receive()
+        reports.append(collector_report)
+
+        # Stage 4: Prometheus scrape.
+        scrape_report = self.check_prometheus_scrape()
+        reports.append(scrape_report)
+
+        # Stage 5: Metric query.
+        query_report = self.check_metric_query(prometheus_metric_name, wait=True)
+        reports.append(query_report)
+
+        return reports
+
+    # ------------------------------------------------------------------
+    # Utility: format all failures
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def format_failures(reports: list[PipelineDiagnosticReport]) -> str:
+        """Format a list of diagnostic reports into a human-readable summary.
+
+        Only includes failed stages in the output.  Returns an empty string
+        if all stages passed.
+
+        Args:
+            reports: List of diagnostic reports from ``run_full_diagnosis``
+                or individual stage checks.
+
+        Returns:
+            A multi-line string summarising all failures, suitable for
+            inclusion in an assertion message.
+        """
+        failures = [r for r in reports if not r.passed]
+        if not failures:
+            return ""
+
+        lines = [
+            "Pipeline diagnostic failures:",
+            "=" * 60,
+        ]
+        for report in failures:
+            lines.append(report.as_error_string())
+            lines.append("")
+
+        lines.append("=" * 60)
+        lines.append(f"Failed stages: {len(failures)}/{len(reports)}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Sample hook input data
 # ---------------------------------------------------------------------------
 
@@ -214,16 +824,13 @@ class TestHookToPrometheusFlow:
         The ``session_start.py`` hook emits a ``claude.session.count`` counter
         which Prometheus exposes as ``claude_session_count_total``.
         """
-        result = _run_hook_script("session_start.py", _SAMPLE_SESSION_START)
-        assert result.returncode == 0, (
-            f"session_start.py exited with {result.returncode}: {result.stderr}"
-        )
-
         prom_name = _prometheus_name("claude.session.count")
-        found = prometheus_client.wait_for_metric(prom_name)
-        assert found, (
-            f"Metric '{prom_name}' not found in Prometheus after session_start"
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
+            "session_start.py", _SAMPLE_SESSION_START, prom_name,
         )
+        failures = TestPipelineDiagnostics.format_failures(reports)
+        assert not failures, failures
 
     # ------------------------------------------------------------------
     # claude.session.duration
@@ -239,16 +846,13 @@ class TestHookToPrometheusFlow:
         which Prometheus exposes as ``claude_session_duration_count`` (and
         ``_bucket``, ``_sum`` series).
         """
-        result = _run_hook_script("session_end.py", _SAMPLE_SESSION_END)
-        assert result.returncode == 0, (
-            f"session_end.py exited with {result.returncode}: {result.stderr}"
-        )
-
         prom_name = _prometheus_name("claude.session.duration")
-        found = prometheus_client.wait_for_metric(prom_name)
-        assert found, (
-            f"Metric '{prom_name}' not found in Prometheus after session_end"
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
+            "session_end.py", _SAMPLE_SESSION_END, prom_name,
         )
+        failures = TestPipelineDiagnostics.format_failures(reports)
+        assert not failures, failures
 
     # ------------------------------------------------------------------
     # claude.tool.invocations
@@ -264,16 +868,13 @@ class TestHookToPrometheusFlow:
         with ``status="started"``.  Prometheus exposes it as
         ``claude_tool_invocations_total``.
         """
-        result = _run_hook_script("pre_tool_use.py", _SAMPLE_PRE_TOOL_USE)
-        assert result.returncode == 0, (
-            f"pre_tool_use.py exited with {result.returncode}: {result.stderr}"
-        )
-
         prom_name = _prometheus_name("claude.tool.invocations")
-        found = prometheus_client.wait_for_metric(prom_name)
-        assert found, (
-            f"Metric '{prom_name}' not found in Prometheus after pre_tool_use"
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
+            "pre_tool_use.py", _SAMPLE_PRE_TOOL_USE, prom_name,
         )
+        failures = TestPipelineDiagnostics.format_failures(reports)
+        assert not failures, failures
 
     # ------------------------------------------------------------------
     # claude.tool.duration
@@ -289,16 +890,13 @@ class TestHookToPrometheusFlow:
         recording tool invocation duration in milliseconds.  Prometheus exposes
         it as ``claude_tool_duration_count`` (and ``_bucket``, ``_sum``).
         """
-        result = _run_hook_script("post_tool_use.py", _SAMPLE_POST_TOOL_USE)
-        assert result.returncode == 0, (
-            f"post_tool_use.py exited with {result.returncode}: {result.stderr}"
-        )
-
         prom_name = _prometheus_name("claude.tool.duration")
-        found = prometheus_client.wait_for_metric(prom_name)
-        assert found, (
-            f"Metric '{prom_name}' not found in Prometheus after post_tool_use"
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
+            "post_tool_use.py", _SAMPLE_POST_TOOL_USE, prom_name,
         )
+        failures = TestPipelineDiagnostics.format_failures(reports)
+        assert not failures, failures
 
     # ------------------------------------------------------------------
     # claude.files.modified
@@ -314,24 +912,20 @@ class TestHookToPrometheusFlow:
         number of files created/edited/deleted.  Prometheus exposes it as
         ``claude_files_modified_total``.
         """
-        result = _run_hook_script(
+        prom_name = _prometheus_name("claude.files.modified")
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
             "stop.py",
             _SAMPLE_STOP,
+            prom_name,
             extra_env={
                 "GITLAB_TOKEN": "",
                 "GITLAB_HOST": "",
                 "GITLAB_PROJECT": "",
             },
         )
-        assert result.returncode == 0, (
-            f"stop.py exited with {result.returncode}: {result.stderr}"
-        )
-
-        prom_name = _prometheus_name("claude.files.modified")
-        found = prometheus_client.wait_for_metric(prom_name)
-        assert found, (
-            f"Metric '{prom_name}' not found in Prometheus after stop"
-        )
+        failures = TestPipelineDiagnostics.format_failures(reports)
+        assert not failures, failures
 
     # ------------------------------------------------------------------
     # claude.tokens.estimated
@@ -347,24 +941,20 @@ class TestHookToPrometheusFlow:
         recording estimated token usage.  Prometheus exposes it as
         ``claude_tokens_estimated_count`` (and ``_bucket``, ``_sum``).
         """
-        result = _run_hook_script(
+        prom_name = _prometheus_name("claude.tokens.estimated")
+        diag = TestPipelineDiagnostics(prometheus_client)
+        reports = diag.run_full_diagnosis(
             "stop.py",
             _SAMPLE_STOP,
+            prom_name,
             extra_env={
                 "GITLAB_TOKEN": "",
                 "GITLAB_HOST": "",
                 "GITLAB_PROJECT": "",
             },
         )
-        assert result.returncode == 0, (
-            f"stop.py exited with {result.returncode}: {result.stderr}"
-        )
-
-        prom_name = _prometheus_name("claude.tokens.estimated")
-        found = prometheus_client.wait_for_metric(prom_name)
-        assert found, (
-            f"Metric '{prom_name}' not found in Prometheus after stop"
-        )
+        failures = TestPipelineDiagnostics.format_failures(reports)
+        assert not failures, failures
 
     # ------------------------------------------------------------------
     # Full pipeline: all metrics in one pass
@@ -378,7 +968,8 @@ class TestHookToPrometheusFlow:
 
         Executes every hook script in order (session_start -> pre_tool_use ->
         post_tool_use -> session_end -> stop) and verifies that all 6 metrics
-        are queryable in Prometheus.
+        are queryable in Prometheus.  Uses ``TestPipelineDiagnostics`` to
+        report exactly which stage failed if any metric is missing.
         """
         hook_sequence: list[tuple[str, dict[str, Any], dict[str, str] | None]] = [
             ("session_start.py", _SAMPLE_SESSION_START, None),
@@ -396,21 +987,30 @@ class TestHookToPrometheusFlow:
             ),
         ]
 
-        for script_name, input_data, extra_env in hook_sequence:
-            result = _run_hook_script(script_name, input_data, extra_env=extra_env)
-            assert result.returncode == 0, (
-                f"{script_name} exited with {result.returncode}: {result.stderr}"
-            )
+        # Run each hook and collect diagnostics for any failures.
+        diag = TestPipelineDiagnostics(prometheus_client)
+        hook_errors: list[str] = []
 
-        missing: list[str] = []
+        for script_name, input_data, extra_env in hook_sequence:
+            result, hook_report = diag.check_hook_execution(
+                script_name, input_data, extra_env=extra_env,
+            )
+            if not hook_report.passed:
+                hook_errors.append(hook_report.as_error_string())
+
+        assert not hook_errors, (
+            "Hook execution failures:\n" + "\n".join(hook_errors)
+        )
+
+        # Check all metrics with diagnostic detail for any missing ones.
+        missing_reports: list[PipelineDiagnosticReport] = []
         for otel_name in _ALL_METRIC_NAMES:
             prom_name = _prometheus_name(otel_name)
-            try:
-                prometheus_client.wait_for_metric(prom_name)
-            except Exception:
-                missing.append(prom_name)
+            query_report = diag.check_metric_query(prom_name, wait=True)
+            if not query_report.passed:
+                missing_reports.append(query_report)
 
-        assert not missing, (
-            f"The following metrics did not appear in Prometheus: "
-            f"{', '.join(missing)}"
+        assert not missing_reports, (
+            "Pipeline metric query failures:\n"
+            + "\n".join(r.as_error_string() for r in missing_reports)
         )
