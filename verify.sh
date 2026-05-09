@@ -190,6 +190,7 @@ tests/test_config.py
 tests/test_otel_metrics.py
 tests/test_gitlab_integration.py
 tests/test_hooks.py
+tests/test_smoke_pipeline.py
 "
 
 for pyfile in $ALL_PY_FILES; do
@@ -304,11 +305,41 @@ else
 fi
 
 # ============================
+# 7. Run smoke tests (requires Docker)
+# ============================
+section "7. Run smoke tests (end-to-end pipeline)"
+
+SMOKE_STATUS="skipped"
+if [ "$DEPS_OK" = true ] && [ -n "$PY" ]; then
+  if command -v docker &>/dev/null && docker info &>/dev/null; then
+    SMOKE_OUTPUT=$($PY -m pytest tests/test_smoke_pipeline.py -v -m smoke 2>&1) || true
+    SMOKE_EXIT=$?
+
+    echo "$SMOKE_OUTPUT" | tail -40
+
+    if [ "$SMOKE_EXIT" -eq 0 ]; then
+      pass "smoke tests: all smoke tests passed"
+      SMOKE_STATUS="passed"
+    else
+      fail "smoke tests: some smoke tests failed (exit code ${SMOKE_EXIT})"
+      SMOKE_STATUS="failed"
+    fi
+  else
+    echo "  ⏭️  Docker not available — skipping smoke tests (Docker required for end-to-end pipeline tests)"
+    SMOKE_STATUS="skipped (no Docker)"
+  fi
+else
+  echo "  ⏭️  Python dependencies not available — skipping smoke tests"
+  SMOKE_STATUS="skipped (no deps)"
+fi
+
+# ============================
 # Summary
 # ============================
 section "VERIFICATION SUMMARY"
 echo "  Passed: ${PASS}"
 echo "  Failed: ${FAIL}"
+echo "  Smoke tests: ${SMOKE_STATUS}"
 if [ "$FAIL" -gt 0 ]; then
   echo ""
   echo "Failures:"
