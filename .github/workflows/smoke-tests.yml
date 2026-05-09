@@ -1,0 +1,66 @@
+# Smoke Tests workflow
+#
+# Validates the end-to-end metrics pipeline:
+#   hook script -> OTel SDK -> OTel Collector -> Prometheus -> Grafana
+#
+# Uses Docker Compose to spin up the full observability stack on
+# ubuntu-latest runners where Docker is available.
+#
+name: "Smoke Tests"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  smoke-tests:
+    name: Run smoke tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: "pip"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run unit tests
+      run: |
+        python -m pytest tests/test_config.py tests/test_otel_metrics.py tests/test_hooks.py tests/test_gitlab_integration.py -v --tb=short
+
+    - name: Start Docker Compose stack
+      run: |
+        docker compose up -d
+        echo "Waiting for services to become healthy..."
+        sleep 15
+
+    - name: Run smoke tests
+      run: |
+        python -m pytest tests/test_smoke_pipeline.py -v -m smoke --tb=short
+
+    - name: Dump service logs on failure
+      if: failure()
+      run: |
+        echo "=== otel-collector logs ==="
+        docker logs otel-collector 2>&1 || true
+        echo ""
+        echo "=== prometheus logs ==="
+        docker logs prometheus 2>&1 || true
+        echo ""
+        echo "=== grafana logs ==="
+        docker logs grafana 2>&1 || true
+
+    - name: Stop Docker Compose stack
+      if: always()
+      run: |
+        docker compose down -v
