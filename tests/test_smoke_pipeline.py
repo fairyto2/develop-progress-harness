@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -111,7 +112,7 @@ def _run_hook_script(
     )
 
     return subprocess.run(
-        ["python", script_path],
+        [sys.executable, script_path],
         input=json.dumps(input_data),
         capture_output=True,
         text=True,
