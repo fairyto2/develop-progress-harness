@@ -173,7 +173,7 @@ class PipelineDiagnosticReport:
     suggestions: list[str] = field(default_factory=list)
 
     def as_error_string(self) -> str:
-    """Format the report as a detailed multi-line error string.
+        """Format the report as a detailed multi-line error string.
 
         Returns:
             A formatted string suitable for inclusion in assertion messages
@@ -1013,4 +1013,244 @@ class TestHookToPrometheusFlow:
         assert not missing_reports, (
             "Pipeline metric query failures:\n"
             + "\n".join(r.as_error_string() for r in missing_reports)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Grafana Dashboard Provisioning Verification
+# ---------------------------------------------------------------------------
+
+# Directory containing provisioned dashboard JSON files.
+_GRAFANA_DASHBOARDS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "infra", "grafana", "dashboards"
+)
+
+# Expected provisioned dashboard titles and their JSON filenames.
+_EXPECTED_DASHBOARDS: dict[str, str] = {
+    "Global Overview": "global-overview.json",
+    "Individual Activity": "individual-activity.json",
+    "Project Detail": "project-detail.json",
+}
+
+
+def _extract_panel_queries(dashboard_path: str) -> list[str]:
+    """Extract unique PromQL expressions from a provisioned dashboard JSON file.
+
+    Reads the dashboard JSON, iterates over all panels (skipping row headers
+    which are layout containers), and collects the ``expr`` field from each
+    panel target.  Returns deduplicated expressions in order of appearance.
+
+    Args:
+        dashboard_path: Absolute or relative path to the dashboard JSON file.
+
+    Returns:
+        A list of unique PromQL expression strings.
+    """
+    with open(dashboard_path, encoding="utf-8") as fh:
+        dashboard = json.load(fh)
+
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    for panel in dashboard.get("panels", []):
+        if panel.get("type") == "row":
+            continue
+        for target in panel.get("targets", []):
+            expr = target.get("expr", "")
+            if expr and expr not in seen:
+                seen.add(expr)
+                queries.append(expr)
+
+    return queries
+
+
+def _substitute_template_vars(expr: str) -> str:
+    """Replace Grafana template variables with safe test values.
+
+    Substitutes dashboard template variables so that PromQL expressions
+    can be executed against Prometheus without Grafana's variable resolver.
+
+    Replacements:
+
+        - ``$__rate_interval`` -> ``5m``
+        - ``$project`` -> ``.*``
+        - ``$user`` -> ``.*``
+
+    Args:
+        expr: Raw PromQL expression containing Grafana template variables.
+
+    Returns:
+        The expression with template variables replaced by safe defaults.
+    """
+    # Replace $__rate_interval first to avoid partial matches on $project/$user.
+    expr = expr.replace("$__rate_interval", "5m")
+    expr = expr.replace("$project", ".*")
+    expr = expr.replace("$user", ".*")
+    return expr
+
+
+@pytest.mark.smoke
+class TestGrafanaProvisioning:
+    """Verifies Grafana datasource configuration and dashboard provisioning.
+
+    Validates the Grafana side of the metrics pipeline:
+
+        1. **Datasource** — A Prometheus datasource is configured via the
+           Grafana API (``/api/datasources``) with the correct type and
+           default flag.
+        2. **Dashboards** — All 3 dashboard JSON files (Global Overview,
+           Individual Activity, Project Detail) are provisioned and
+           discoverable via the Grafana search API (``/api/search``).
+        3. **Panel queries** — Every PromQL expression used by dashboard
+           panels returns a valid response from Prometheus (no parse errors
+           or execution errors).
+
+    Depends on the ``grafana_client`` and ``prometheus_client`` fixtures
+    defined in ``tests/conftest.py``.
+    """
+
+    # ------------------------------------------------------------------
+    # Datasource verification
+    # ------------------------------------------------------------------
+
+    def test_prometheus_datasource_configured(
+        self,
+        grafana_client,
+    ) -> None:
+        """Prometheus datasource should exist and be configured as default.
+
+        Queries the Grafana ``/api/datasources`` endpoint and verifies that
+        a datasource named ``"Prometheus"`` exists with ``type ==
+        "prometheus"`` and ``isDefault == True``, matching the provisioning
+        configuration in
+        ``infra/grafana/provisioning/datasources/datasource.yml``.
+        """
+        datasources = grafana_client._api_request("/api/datasources")
+        assert isinstance(datasources, list), (
+            f"Expected /api/datasources to return a list, "
+            f"got {type(datasources).__name__}"
+        )
+
+        prom_ds = None
+        for ds in datasources:
+            if ds.get("name") == "Prometheus":
+                prom_ds = ds
+                break
+
+        assert prom_ds is not None, (
+            "No datasource named 'Prometheus' found in Grafana. "
+            f"Available datasources: "
+            f"{[ds.get('name') for ds in datasources]}"
+        )
+
+        assert prom_ds.get("type") == "prometheus", (
+            f"Prometheus datasource has unexpected type: "
+            f"{prom_ds.get('type')!r} (expected 'prometheus')"
+        )
+
+        assert prom_ds.get("isDefault") is True, (
+            "Prometheus datasource is not configured as the default "
+            "datasource.  Check "
+            "infra/grafana/provisioning/datasources/datasource.yml"
+        )
+
+        logger.info(
+            "Prometheus datasource verified: url=%s, access=%s",
+            prom_ds.get("url"),
+            prom_ds.get("access"),
+        )
+
+    # ------------------------------------------------------------------
+    # Dashboard provisioning verification
+    # ------------------------------------------------------------------
+
+    def test_all_dashboards_provisioned(
+        self,
+        grafana_client,
+    ) -> None:
+        """All 3 dashboards should be provisioned and discoverable via API.
+
+        Queries the Grafana ``/api/search?type=dash-db`` endpoint and
+        verifies that each expected dashboard title is present.
+        """
+        dashboards = grafana_client.list_dashboards()
+        provisioned_titles = [d.get("title") for d in dashboards]
+
+        missing: list[str] = []
+        for title in _EXPECTED_DASHBOARDS:
+            if title not in provisioned_titles:
+                missing.append(title)
+
+        assert not missing, (
+            "The following dashboards are not provisioned in Grafana: "
+            f"{', '.join(missing)}. "
+            f"Provisioned dashboards: {provisioned_titles}. "
+            "Check infra/grafana/provisioning/dashboards/dashboard.yml "
+            "and the dashboard JSON files in infra/grafana/dashboards/."
+        )
+
+        logger.info(
+            "All %d dashboards provisioned: %s",
+            len(_EXPECTED_DASHBOARDS),
+            ", ".join(_EXPECTED_DASHBOARDS),
+        )
+
+    # ------------------------------------------------------------------
+    # Panel query validation
+    # ------------------------------------------------------------------
+
+    def test_dashboard_panel_queries_valid(
+        self,
+        grafana_client,
+        prometheus_client,
+    ) -> None:
+        """All dashboard panel PromQL queries should return valid Prometheus responses.
+
+        For each provisioned dashboard JSON file:
+
+            1. Load the JSON and extract all panel PromQL expressions.
+            2. Substitute Grafana template variables with safe defaults.
+            3. Execute each query against Prometheus.
+            4. Verify the response status is ``"success"`` (no parse or
+               execution errors).
+
+        An empty result set (``data.result == []``) is acceptable — the
+        test only verifies that queries are syntactically valid and
+        Prometheus can execute them without errors.
+        """
+        errors: list[str] = []
+
+        for title, filename in _EXPECTED_DASHBOARDS.items():
+            dashboard_path = os.path.join(
+                _GRAFANA_DASHBOARDS_DIR, filename
+            )
+            queries = _extract_panel_queries(dashboard_path)
+
+            for raw_expr in queries:
+                expr = _substitute_template_vars(raw_expr)
+                try:
+                    result = prometheus_client.query(expr)
+                except Exception as exc:
+                    errors.append(
+                        f"[{title}] Query failed: {raw_expr[:80]}... "
+                        f"-> {exc}"
+                    )
+                    continue
+
+                if result.get("status") != "success":
+                    error_msg = result.get("error", "unknown error")
+                    errors.append(
+                        f"[{title}] Query returned error: "
+                        f"{raw_expr[:80]}... -> {error_msg}"
+                    )
+
+        assert not errors, (
+            "Dashboard panel query validation failures:\n"
+            + "\n".join(errors)
+        )
+
+        logger.info(
+            "All dashboard panel queries validated successfully "
+            "across %d dashboards",
+            len(_EXPECTED_DASHBOARDS),
         )
