@@ -65,8 +65,8 @@ _PROMETHEUS_COUNTER_NAMES: dict[str, str] = {
 }
 
 _PROMETHEUS_HISTOGRAM_NAMES: dict[str, str] = {
-    "claude.tool.duration": "claude_tool_duration_count",
-    "claude.session.duration": "claude_session_duration_count",
+    "claude.tool.duration": "claude_tool_duration_milliseconds_count",
+    "claude.session.duration": "claude_session_duration_seconds_count",
     "claude.tokens.estimated": "claude_tokens_estimated_count",
 }
 
