@@ -225,7 +225,7 @@ class TestPipelineDiagnostics:
     def __init__(
         self,
         prometheus_client: Any,
-        collector_url: str = "http://localhost:8889",
+        collector_url: str = "http://localhost:13133",
         prometheus_url: str = "http://localhost:9090",
     ) -> None:
         self._prom = prometheus_client
