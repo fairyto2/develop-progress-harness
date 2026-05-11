@@ -3,9 +3,8 @@
 Provides meter initialization, counter/histogram creation helpers, and
 a critical flush_metrics() shutdown function for short-lived hook processes.
 
-Hook scripts execute in milliseconds, but PeriodicExportingMetricReader only
-exports every 10 seconds.  Without an explicit force_flush + shutdown before
-process exit, recorded metrics would be silently lost.
+Uses InstantaneousMetricReader so that force_flush() performs a synchronous
+export, guaranteeing metrics reach the collector before the process exits.
 """
 
 import logging
@@ -13,7 +12,7 @@ import warnings
 
 from opentelemetry.metrics import Counter, Histogram, Meter, get_meter_provider, set_meter_provider
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.export import InstantaneousMetricReader
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 
 from lib.config import Config
@@ -27,10 +26,10 @@ _provider: MeterProvider | None = None
 def init_meter(service_name: str) -> Meter:
     """Initialize OTel meter with OTLP gRPC export to collector.
 
-    Creates a MeterProvider backed by a PeriodicExportingMetricReader (10 s
-    interval) and an OTLPMetricExporter using gRPC.  The reader's endpoint
-    is read from the OTEL_EXPORTER_OTLP_ENDPOINT environment variable via
-    lib.config.Config.
+    Creates a MeterProvider backed by an InstantaneousMetricReader and an
+    OTLPMetricExporter using gRPC.  InstantaneousMetricReader exports
+    synchronously on force_flush(), making it reliable for short-lived hook
+    processes.
 
     Args:
         service_name: Logical service name used as the meter name.
@@ -47,10 +46,7 @@ def init_meter(service_name: str) -> Meter:
         endpoint=endpoint,
         insecure=True,
     )
-    reader = PeriodicExportingMetricReader(
-        exporter,
-        export_interval_millis=10_000,
-    )
+    reader = InstantaneousMetricReader(exporter)
     _provider = MeterProvider(metric_readers=[reader])
     set_meter_provider(_provider)
 
@@ -98,9 +94,7 @@ def create_histogram(meter: Meter, name: str, description: str, unit: str = "ms"
 def flush_metrics() -> None:
     """Force-flush all pending metrics.  CRITICAL for short-lived processes.
 
-    Hook scripts are ephemeral processes (milliseconds).  The
-    PeriodicExportingMetricReader exports every 10 s, so metrics would be
-    lost without an explicit flush before the script exits.  This function
+    Hook scripts are ephemeral processes (milliseconds).  This function
     must be called at the end of every hook script to guarantee metrics are
     exported to the OTel Collector.
 
