@@ -59,9 +59,9 @@ _HOOK_ENV = {
 # OTel counters receive a ``_total`` suffix when exported to Prometheus.
 # OTel histograms are exported as ``_bucket``, ``_sum``, ``_count`` series.
 _PROMETHEUS_COUNTER_NAMES: dict[str, str] = {
-    "claude.tool.invocations": "claude_tool_invocations_total",
+    "claude.tool.invocations": "claude_tool_invocations_count_total",
     "claude.session.count": "claude_session_count_total",
-    "claude.files.modified": "claude_files_modified_total",
+    "claude.files.modified": "claude_files_modified_count_total",
 }
 
 _PROMETHEUS_HISTOGRAM_NAMES: dict[str, str] = {
