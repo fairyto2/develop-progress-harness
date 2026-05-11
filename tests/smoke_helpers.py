@@ -272,7 +272,7 @@ class DockerComposeManager:
         results: dict[str, bool] = {}
 
         services = [
-            ("otel-collector", 8889, "/"),
+            ("otel-collector", 13133, "/"),
             ("prometheus", 9090, "/-/healthy"),
             ("grafana", 3000, "/api/health"),
         ]
