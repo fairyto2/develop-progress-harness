@@ -531,7 +531,6 @@ class TestFlushMetricsCalled:
             assert exc_info.value.code == 0
 
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()
 
     def test_session_end_calls_flush(
         self,
@@ -550,7 +549,6 @@ class TestFlushMetricsCalled:
             assert exc_info.value.code == 0
 
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()
 
     def test_pre_tool_use_calls_flush(
         self,
@@ -569,7 +567,6 @@ class TestFlushMetricsCalled:
             assert exc_info.value.code == 0
 
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()
 
     def test_post_tool_use_calls_flush(
         self,
@@ -593,7 +590,6 @@ class TestFlushMetricsCalled:
             assert exc_info.value.code == 0
 
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()
 
     def test_stop_calls_flush(
         self,
@@ -615,7 +611,6 @@ class TestFlushMetricsCalled:
             assert exc_info.value.code == 0
 
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +826,6 @@ class TestFlushOnInvalidInput:
 
         # Stop hook calls flush_metrics() even on JSON parse failure.
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()
 
     def test_stop_flushes_on_empty_stdin(
         self,
@@ -849,4 +843,3 @@ class TestFlushOnInvalidInput:
 
         # Stop hook calls flush_metrics() even on empty stdin.
         mock_meter_provider.force_flush.assert_called()
-        mock_meter_provider.shutdown.assert_called()

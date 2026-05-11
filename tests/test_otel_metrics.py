@@ -76,40 +76,30 @@ class TestInitMeter:
 class TestFlushMetrics:
     """Tests for flush_metrics() shutdown behavior."""
 
-    def test_flush_metrics_calls_force_flush_and_shutdown(
+    def test_flush_metrics_calls_force_flush(
         self,
         minimal_env: dict[str, str],
         mock_meter_provider: MagicMock,
     ) -> None:
-        """flush_metrics() must call force_flush() then shutdown()."""
+        """flush_metrics() must call force_flush()."""
         # Initialize provider first so _provider is set.
         init_meter("test-service")
 
         flush_metrics()
 
         mock_meter_provider.force_flush.assert_called_once()
-        mock_meter_provider.shutdown.assert_called_once()
 
-    def test_flush_metrics_order_force_flush_before_shutdown(
+    def test_flush_metrics_does_not_call_shutdown(
         self,
         minimal_env: dict[str, str],
         mock_meter_provider: MagicMock,
     ) -> None:
-        """force_flush() must be called before shutdown()."""
+        """flush_metrics() must NOT call shutdown() to avoid interrupting exports."""
         init_meter("test-service")
-
-        # Track call order using a list.
-        call_order: list[str] = []
-        mock_meter_provider.force_flush.side_effect = (
-            lambda: call_order.append("force_flush")
-        )
-        mock_meter_provider.shutdown.side_effect = (
-            lambda: call_order.append("shutdown")
-        )
 
         flush_metrics()
 
-        assert call_order == ["force_flush", "shutdown"]
+        mock_meter_provider.shutdown.assert_not_called()
 
     def test_flush_metrics_noop_when_provider_none(self) -> None:
         """flush_metrics() should be a no-op when _provider is None."""
@@ -135,22 +125,6 @@ class TestFlushMetrics:
         with pytest.warns(UserWarning, match="Failed to force-flush"):
             flush_metrics()
 
-        # shutdown should still be called even if force_flush failed.
-        mock_meter_provider.shutdown.assert_called_once()
-
-    def test_flush_metrics_survives_shutdown_error(
-        self,
-        minimal_env: dict[str, str],
-        mock_meter_provider: MagicMock,
-    ) -> None:
-        """flush_metrics() should warn (not raise) if shutdown fails."""
-        init_meter("test-service")
-        mock_meter_provider.shutdown.side_effect = RuntimeError("boom")
-
-        with pytest.warns(UserWarning, match="Failed to shut down"):
-            flush_metrics()
-
-        # force_flush should still have been called.
         mock_meter_provider.force_flush.assert_called_once()
 
 
