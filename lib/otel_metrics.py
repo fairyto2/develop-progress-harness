@@ -104,15 +104,15 @@ def flush_metrics() -> None:
     must be called at the end of every hook script to guarantee metrics are
     exported to the OTel Collector.
 
-    Calls ``provider.force_flush()`` which performs a synchronous
-    collect-and-export cycle.  ``shutdown()`` is intentionally NOT called
-    because it can interrupt the in-flight gRPC export started by
-    ``force_flush()``.
+    Calls ``provider.force_flush()`` which returns a Future that is resolved
+    once the export completes.  We wait on this Future to ensure the gRPC
+    export finishes before the process exits.
     """
     global _provider
     if _provider is not None:
         try:
-            _provider.force_flush()
+            future = _provider.force_flush()
+            future.result(timeout=10)
         except Exception:
             warnings.warn(
                 "Failed to force-flush OTel metrics provider",
