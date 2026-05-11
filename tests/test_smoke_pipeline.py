@@ -232,6 +232,24 @@ class TestPipelineDiagnostics:
         self._collector_url = collector_url
         self._prometheus_url = prometheus_url
 
+    def _query_collector_metrics(self, metric_name: str) -> str:
+        """Query collector /metrics endpoint for debug info.
+
+        Returns a string with matching metric lines or an error message.
+        """
+        import urllib.request
+        try:
+            url = "http://localhost:8889/metrics"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode()
+                lines = [l for l in data.splitlines()
+                         if l.startswith("#") or metric_name.replace("_total", "").replace("_count", "").replace("_sum", "").replace("_bucket", "") in l
+                         or "claude" in l]
+                return "\n\nCollector /metrics claude lines:\n" + "\n".join(lines[:50])
+        except Exception as exc:
+            return f"\n\nCould not query collector /metrics: {exc}"
+
     # ------------------------------------------------------------------
     # Stage 1: Hook Execution
     # ------------------------------------------------------------------
@@ -628,6 +646,16 @@ class TestPipelineDiagnostics:
             else:
                 found = self._prom.query_metric_exists(metric_name)
                 if not found:
+                    # Query collector /metrics for debug info
+                    collector_debug = self._query_collector_metrics(metric_name)
+                    return PipelineDiagnosticReport(
+                        stage="metric_query",
+                        passed=False,
+                        message=f"Metric '{metric_name}' not found in Prometheus",
+                        details=(
+                            "A single query found no data points for this metric."
+                            + collector_debug
+                        ),
                     return PipelineDiagnosticReport(
                         stage="metric_query",
                         passed=False,
@@ -641,11 +669,12 @@ class TestPipelineDiagnostics:
                         ],
                     )
         except Exception as exc:
+            collector_debug = self._query_collector_metrics(metric_name)
             return PipelineDiagnosticReport(
                 stage="metric_query",
                 passed=False,
                 message=f"Failed to query metric '{metric_name}' in Prometheus",
-                details=str(exc),
+                details=str(exc) + collector_debug,
                 suggestions=[
                     "Verify the metric name is correct (check _PROMETHEUS_COUNTER_NAMES/_PROMETHEUS_HISTOGRAM_NAMES).",
                     "Check that the hook script ran successfully and exported the metric.",
