@@ -656,11 +656,6 @@ class TestPipelineDiagnostics:
                             "A single query found no data points for this metric."
                             + collector_debug
                         ),
-                    return PipelineDiagnosticReport(
-                        stage="metric_query",
-                        passed=False,
-                        message=f"Metric '{metric_name}' not found in Prometheus",
-                        details="A single query found no data points for this metric.",
                         suggestions=[
                             "The metric may need more time to propagate. Retry with wait=True.",
                             "Verify the hook script emitted this metric (check otel_export stage).",
