@@ -4,8 +4,8 @@ Provides meter initialization, counter/histogram creation helpers, and
 a critical flush_metrics() shutdown function for short-lived hook processes.
 
 Hook scripts execute in milliseconds, but PeriodicExportingMetricReader only
-exports every 10 seconds.  Without an explicit force_flush + shutdown before
-process exit, recorded metrics would be silently lost.
+exports every 10 seconds.  Without an explicit force_flush before process
+exit, recorded metrics would be silently lost.
 """
 
 import logging
@@ -104,23 +104,17 @@ def flush_metrics() -> None:
     must be called at the end of every hook script to guarantee metrics are
     exported to the OTel Collector.
 
-    Calls ``provider.force_flush()`` followed by ``provider.shutdown()``.
-    Errors during flush/shutdown are caught and logged as warnings so that
-    telemetry infrastructure issues never block the hook script.
+    Calls ``provider.force_flush()`` which returns a Future that is resolved
+    once the export completes.  We wait on this Future to ensure the gRPC
+    export finishes before the process exits.
     """
     global _provider
     if _provider is not None:
         try:
-            _provider.force_flush()
+            future = _provider.force_flush()
+            future.result(timeout=10)
         except Exception:
             warnings.warn(
                 "Failed to force-flush OTel metrics provider",
-                stacklevel=2,
-            )
-        try:
-            _provider.shutdown()
-        except Exception:
-            warnings.warn(
-                "Failed to shut down OTel metrics provider",
                 stacklevel=2,
             )

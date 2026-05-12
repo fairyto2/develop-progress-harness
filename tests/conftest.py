@@ -5,6 +5,8 @@ Provides reusable fixtures for:
     - Mock glab subprocess (no real GitLab API calls)
     - Sample hook JSON data for each Claude Code event type
     - Environment variable setup/teardown
+    - Docker Compose lifecycle for smoke tests
+    - Prometheus and Grafana API clients for smoke tests
 """
 
 import json
@@ -12,6 +14,29 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Pytest Configuration
+# ---------------------------------------------------------------------------
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom pytest markers.
+
+    Registers the ``smoke`` marker used to segregate end-to-end smoke tests
+    (which require Docker) from fast unit tests.  Smoke tests are run via::
+
+        python -m pytest tests/ -v -m smoke
+
+    And excluded from normal unit test runs via::
+
+        python -m pytest tests/ -v -m "not smoke"
+    """
+    config.addinivalue_line(
+        "markers",
+        "smoke: end-to-end smoke test (requires Docker Compose stack)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +371,118 @@ def json_stdin_factory():
         return mock_stdin
 
     return _factory
+
+
+# ---------------------------------------------------------------------------
+# Smoke Test Fixtures (Docker Compose, Prometheus, Grafana)
+# ---------------------------------------------------------------------------
+#
+# These fixtures are used by end-to-end smoke tests marked with ``@pytest.mark.smoke``.
+# They manage the lifecycle of the Docker Compose stack (OTel Collector, Prometheus,
+# Grafana) and provide pre-configured API clients for querying metrics and dashboards.
+#
+# To run smoke tests:
+#     python -m pytest tests/test_smoke_pipeline.py -v -m smoke
+#
+# To skip smoke tests during normal unit test runs:
+#     python -m pytest tests/ -v -m "not smoke"
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def docker_compose_stack():
+    """Start the Docker Compose stack and tear it down after all tests.
+
+    This session-scoped fixture starts the full metrics pipeline stack
+    (OTel Collector, Prometheus, Grafana) via ``docker compose up -d``.
+    The stack is torn down in the fixture's finalizer after all tests in
+    the session have completed, regardless of pass/fail status.
+
+    Yields:
+        A ``tests.smoke_helpers.DockerComposeManager`` instance that can be
+        used for additional Compose operations (e.g. checking logs).
+
+    Example::
+
+        def test_something(docker_compose_stack):
+            manager = docker_compose_stack
+            assert manager.wait_for_all_services()
+    """
+    from tests.smoke_helpers import DockerComposeManager
+
+    manager = DockerComposeManager()
+
+    # Start the stack.  Let CalledProcessError propagate if Docker is not
+    # available or the Compose file is invalid — pytest will report it
+    # clearly.
+    manager.start()
+
+    # Register a finalizer so the stack is torn down even if tests fail.
+    yield manager
+
+    manager.stop()
+
+
+@pytest.fixture(scope="session")
+def healthy_services(docker_compose_stack):
+    """Wait for all pipeline services to become healthy.
+
+    Depends on ``docker_compose_stack`` (which starts the containers) and
+    then polls the health endpoints of OTel Collector, Prometheus, and
+    Grafana until they respond successfully or the startup timeout expires.
+
+    Yields:
+        A dict mapping service names (``"otel-collector"``,
+        ``"prometheus"``, ``"grafana"``) to booleans indicating whether
+        each service passed its health check.
+
+    Raises:
+        tests.smoke_helpers.RetryTimeoutError: If any service fails to
+            become healthy within the configured timeout.
+    """
+    results = docker_compose_stack.wait_for_all_services()
+
+    # Report which services are unhealthy so the test output is clear.
+    unhealthy = [name for name, ok in results.items() if not ok]
+    if unhealthy:
+        pytest.fail(
+            f"Services failed health check: {', '.join(unhealthy)}. "
+            "Check 'docker compose logs' for details."
+        )
+
+    yield results
+
+
+@pytest.fixture()
+def prometheus_client(healthy_services):
+    """Provide a ``PrometheusClient`` for querying metrics.
+
+    Depends on ``healthy_services`` to ensure Prometheus is up and ready
+    before queries are attempted.  The client is created fresh for each
+    test function so that query state does not leak between tests.
+
+    Yields:
+        A ``tests.smoke_helpers.PrometheusClient`` instance configured to
+        query the local Prometheus server at ``http://localhost:9090``.
+    """
+    from tests.smoke_helpers import PrometheusClient
+
+    yield PrometheusClient()
+
+
+@pytest.fixture()
+def grafana_client(healthy_services, monkeypatch: pytest.MonkeyPatch):
+    """Provide a ``GrafanaClient`` for checking dashboard provisioning.
+
+    Depends on ``healthy_services`` to ensure Grafana is up and ready
+    before API calls are attempted.  Reads the ``GF_SECURITY_ADMIN_PASSWORD``
+    environment variable (defaulting to ``"admin"``) for authentication.
+
+    Yields:
+        A ``tests.smoke_helpers.GrafanaClient`` instance configured to
+        query the local Grafana server at ``http://localhost:3000``.
+    """
+    from tests.smoke_helpers import GrafanaClient
+
+    password = os.environ.get("GF_SECURITY_ADMIN_PASSWORD", "admin")
+    yield GrafanaClient(password=password)

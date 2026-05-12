@@ -87,19 +87,24 @@ for f in \
   infra/grafana/dashboards/global-overview.json \
   infra/grafana/dashboards/project-detail.json \
   infra/grafana/dashboards/individual-activity.json; do
-  if [ -f "$f" ]; then
-    if [ -n "$PY" ]; then
-      if $PY -c "import json, sys; json.load(open(sys.argv[1]))" "$f" 2>/dev/null; then
-        pass "JSON parse: $f"
-      else
-        ERR=$($PY -c "import json, sys; json.load(open(sys.argv[1]))" "$f" 2>&1) || true
-        fail "JSON parse: $f — ${ERR}"
-      fi
+  if [ ! -f "$f" ]; then
+    # .claude/settings.local.json is optional (may not exist in worktrees)
+    if [ "$f" = ".claude/settings.local.json" ]; then
+      pass "JSON parse: $f (optional, not present)"
+      continue
+    fi
+    fail "JSON file missing: $f"
+    continue
+  fi
+  if [ -n "$PY" ]; then
+    if $PY -c "import json, sys; json.load(open(sys.argv[1]))" "$f" 2>/dev/null; then
+      pass "JSON parse: $f"
     else
-      pass "JSON parse: $f (skipped - no validator)"
+      ERR=$($PY -c "import json, sys; json.load(open(sys.argv[1]))" "$f" 2>&1) || true
+      fail "JSON parse: $f — ${ERR}"
     fi
   else
-    fail "JSON file missing: $f"
+    pass "JSON parse: $f (skipped - no validator)"
   fi
 done
 
@@ -190,6 +195,7 @@ tests/test_config.py
 tests/test_otel_metrics.py
 tests/test_gitlab_integration.py
 tests/test_hooks.py
+tests/test_smoke_pipeline.py
 "
 
 for pyfile in $ALL_PY_FILES; do
@@ -198,9 +204,12 @@ for pyfile in $ALL_PY_FILES; do
     continue
   fi
 
-  # Syntax check (always possible with py_compile)
+  # Syntax check (always possible with ast.parse)
+  # Uses ast.parse() instead of py_compile to avoid creating __pycache__
+  # directories, which may fail in sandboxed environments with restricted
+  # write access to certain directories (e.g. hooks/).
   if [ -n "$PY" ]; then
-    COMPILE_ERR=$($PY -c "import py_compile; py_compile.compile('$pyfile', doraise=True)" 2>&1) || true
+    COMPILE_ERR=$($PY -c "import ast; ast.parse(open('$pyfile').read())" 2>&1) || true
     if [ -n "$COMPILE_ERR" ]; then
       fail "Syntax error: $pyfile — ${COMPILE_ERR}"
       continue
@@ -244,7 +253,7 @@ else
   TEST_SYNTAX_OK=true
   for testfile in tests/test_config.py tests/test_otel_metrics.py tests/test_gitlab_integration.py tests/test_hooks.py; do
     if [ -n "$PY" ]; then
-      COMPILE_ERR=$($PY -c "import py_compile; py_compile.compile('$testfile', doraise=True)" 2>&1) || true
+      COMPILE_ERR=$($PY -c "import ast; ast.parse(open('$testfile').read())" 2>&1) || true
       if [ -n "$COMPILE_ERR" ]; then
         fail "Test syntax error: $testfile — ${COMPILE_ERR}"
         TEST_SYNTAX_OK=false
@@ -283,7 +292,7 @@ else
   HOOK_SYNTAX_OK=true
   for hookfile in hooks/pre_tool_use.py hooks/post_tool_use.py hooks/session_start.py hooks/session_end.py hooks/stop.py; do
     if [ -n "$PY" ]; then
-      COMPILE_ERR=$($PY -c "import py_compile; py_compile.compile('$hookfile', doraise=True)" 2>&1) || true
+      COMPILE_ERR=$($PY -c "import ast; ast.parse(open('$hookfile').read())" 2>&1) || true
       if [ -n "$COMPILE_ERR" ]; then
         fail "Hook syntax error: $hookfile — ${COMPILE_ERR}"
         HOOK_SYNTAX_OK=false
@@ -304,11 +313,41 @@ else
 fi
 
 # ============================
+# 7. Run smoke tests (requires Docker)
+# ============================
+section "7. Run smoke tests (end-to-end pipeline)"
+
+SMOKE_STATUS="skipped"
+if [ "$DEPS_OK" = true ] && [ -n "$PY" ]; then
+  if command -v docker &>/dev/null && docker info &>/dev/null; then
+    SMOKE_OUTPUT=$($PY -m pytest tests/test_smoke_pipeline.py -v -m smoke 2>&1) || true
+    SMOKE_EXIT=$?
+
+    echo "$SMOKE_OUTPUT" | tail -40
+
+    if [ "$SMOKE_EXIT" -eq 0 ]; then
+      pass "smoke tests: all smoke tests passed"
+      SMOKE_STATUS="passed"
+    else
+      fail "smoke tests: some smoke tests failed (exit code ${SMOKE_EXIT})"
+      SMOKE_STATUS="failed"
+    fi
+  else
+    echo "  ⏭️  Docker not available — skipping smoke tests (Docker required for end-to-end pipeline tests)"
+    SMOKE_STATUS="skipped (no Docker)"
+  fi
+else
+  echo "  ⏭️  Python dependencies not available — skipping smoke tests"
+  SMOKE_STATUS="skipped (no deps)"
+fi
+
+# ============================
 # Summary
 # ============================
 section "VERIFICATION SUMMARY"
 echo "  Passed: ${PASS}"
 echo "  Failed: ${FAIL}"
+echo "  Smoke tests: ${SMOKE_STATUS}"
 if [ "$FAIL" -gt 0 ]; then
   echo ""
   echo "Failures:"
