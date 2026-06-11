@@ -75,6 +75,10 @@ An observability and progress-tracking system for AI-assisted coding with Claude
 5. **Grafana** queries Prometheus and renders three-tier dashboards (global, project, individual)
 6. **Stop hook** creates/updates GitLab issues with human-readable progress summaries via `glab` CLI
 
+## Additional Tools
+
+- [ZenTao and GitLab Issue Sync](docs/zentao-gitlab-sync.md) - polling-based sync for environments where GitLab cannot reach ZenTao webhooks. It maps GitLab issue labels to ZenTao bugs/stories and keeps progress labels such as `status:doing` or `status:closed` in sync.
+
 ## Prerequisites
 
 - **Docker** & **Docker Compose** (v2+)
@@ -236,6 +240,13 @@ echo '{"session_id":"test-123","project":"my-project","user":"dev"}' | python3 h
 │   ├── config.py                       # Environment variable loading and validation
 │   ├── otel_metrics.py                 # OTel meter init, counter/histogram helpers, flush
 │   └── gitlab_integration.py           # glab CLI wrapper (issue create/note/update)
+│
+├── tools/                              # Optional operational tools
+│   ├── zentao_gitlab_issue_sync.php    # Polling GitLab issue <-> ZenTao bug/story sync
+│   └── zentao_gitlab_issue_sync.config.example.php
+│
+├── docs/
+│   └── zentao-gitlab-sync.md           # Deployment, label mapping, and operations guide
 │
 ├── infra/                              # Infrastructure configuration
 │   ├── otel-collector/

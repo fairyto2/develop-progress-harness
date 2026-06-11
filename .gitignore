@@ -61,6 +61,7 @@ venv/
 
 # Environment
 .env
+tools/zentao_gitlab_issue_sync.config.php
 
 # Claude Code local settings (contains hook config with local paths)
 .claude/settings.local.json
